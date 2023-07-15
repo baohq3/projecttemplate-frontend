@@ -20,7 +20,10 @@ resources:
 
 variables:
   - group: demo_var
-  - group: bookstore
+  - name: projectname
+    value: projecttemplate-frontend
+  - name: toolversion
+    value: 16
 
 stages:
   - template: templates/react/build.yml@devops
