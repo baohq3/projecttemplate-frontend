@@ -1,7 +1,7 @@
 #!/usr/bin/env groovy
 //========================================================================
 // Demo CI
-// Version: v1.x
+// Version: v2.x
 //========================================================================
 @Library('jenkins-devops-ci@pisharped') _
 reactPipeline script: this
