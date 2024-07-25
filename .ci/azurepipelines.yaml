@@ -1,0 +1,224 @@
+trigger:
+  branches:
+    include:
+    - main
+    - develop
+    - azuredevops
+    - feature/*
+    - bug/*
+
+pr:
+  branches:
+    include:
+    - main
+    - develop
+
+variables:
+  - group: demo_var
+  - group: fe
+
+# Pool build
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: ScanSecrets
+  jobs:
+    - job: scansecrets
+      steps:
+      - checkout: self
+        
+      - task: trivy@1
+        inputs:
+          version: 'latest'
+          path: '.'
+          severities: 'CRITICAL,HIGH'
+          ignoreUnfixed: true
+          exitCode: '0'
+          devMode: true
+          options: '--skip-dirs ./.ci'
+
+- stage: Build
+  jobs:
+    - job: build
+           
+      steps:
+      - checkout: self
+
+      - task: NodeTool@0
+        displayName: Use Node version
+        inputs:
+          versionSpec: 16.x
+
+      - task: replacetokens@5
+        inputs:
+          rootDirectory: '$(Build.SourcesDirectory)'
+          targetFiles: '**/*.env.azure'
+          encoding: 'auto'
+          tokenPattern: 'default'
+          writeBOM: true
+          actionOnMissing: 'warn'
+          keepToken: false
+          actionOnNoFiles: 'continue'
+          enableTransforms: false
+          useLegacyPattern: false
+          enableTelemetry: true
+        displayName: 'Replace env'
+
+      - task: SonarCloudPrepare@2
+        inputs:
+          SonarCloud: 'sonarcloud'
+          organization: 'loctad'
+          scannerMode: 'CLI'
+          configMode: 'manual'
+          cliProjectKey: 'loctad_projecttemplate-frontend'
+          cliProjectName: 'projecttemplate-frontend'
+          cliSources: '.'
+
+      - task: Npm@1
+        displayName: Npm Install
+        inputs:
+          command: 'ci'
+        env:
+          REACT_APP_ENV: Production
+
+      - task: Npm@1
+        displayName: Npm Run Build
+        inputs:
+          command: 'custom'
+          customCommand: 'run build'
+        env:
+          REACT_APP_ENV: Production
+
+      - task: SonarCloudAnalyze@2
+        inputs:
+          jdkversion: 'JAVA_HOME_21_X64'
+
+      - task: SonarCloudPublish@2
+        inputs:
+          pollingTimeoutSec: '300'
+
+      - task: Npm@1
+        displayName: Run Unit Test
+        inputs:
+          command: 'custom'
+          customCommand: 'run test'
+        env:
+          REACT_APP_ENV: Production
+         
+      - task: Docker@2
+        displayName: Login to ACR
+        inputs:
+          containerRegistry: 'registry'
+          command: 'login'
+
+      - task: Docker@2
+        displayName: Build Docker Image
+        inputs:
+          containerRegistry: 'registry'
+          repository: taloc/$(Build.Repository.Name)
+          command: build
+          Dockerfile: './.ci/Dockerfile.ci'
+          buildContext: '.'
+          arguments: '--build-arg BASEIMG=taloc/ubuntu --build-arg IMG_VERSION=jammy-node16-nginx'
+          tags: |
+            $(Build.BuildId)
+
+      # Push Images to ACR
+      - task: Docker@2
+        displayName: Push Docker Image
+        inputs:
+          command: push
+          repository: taloc/$(Build.Repository.Name)
+          containerRegistry: 'registry'
+          tags: |
+            $(Build.BuildId)
+
+      # Trivy
+      # - task: trivy@1
+      #   displayName: Scan Source Code
+      #   inputs:
+      #     version: '1.4.1'
+      #     path: './src'
+      #     severities: 'CRITICAL,HIGH'
+      #     exitCode: '0'
+
+      # - task: trivy@1
+      #   displayName: Scan Docker Images
+      #   inputs:
+      #     version: '1.4.1'
+      #     loginDockerConfig: true
+      #     image: taloc/$(Build.Repository.Name):$(Build.BuildId)
+      #     severities: 'CRITICAL,HIGH'
+      #     exitCode: '0'
+      # - task: trivy@1
+      #   inputs:
+      #     version: 'latest'
+      #     debug: true
+      #     loginDockerConfig: true
+      #     image: 'taloc/$(Build.Repository.Name):$(Build.BuildId)'
+      #     severities: 'CRITICAL,HIGH'
+      #     ignoreUnfixed: true
+      #     exitCode: '0'
+      #     devMode: true
+
+      - script: |
+          sudo apt-get update
+          sudo apt-get install -y wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy
+        displayName: 'Install Trivy'
+        
+      - script: |
+          trivy image --severity HIGH,CRITICAL taloc/$(Build.Repository.Name):$(Build.BuildId)
+        displayName: 'Run Trivy Scan'
+
+      - task: replacetokens@5
+        inputs:
+          rootDirectory: '$(Build.SourcesDirectory)/.cd'
+          targetFiles: '**/*.yml'
+          encoding: 'auto'
+          tokenPattern: 'default'
+          writeBOM: true
+          actionOnMissing: 'warn'
+          keepToken: false
+          actionOnNoFiles: 'continue'
+          enableTransforms: false
+          useLegacyPattern: false
+          enableTelemetry: true
+        displayName: 'Replace variables'
+
+      - task: PublishPipelineArtifact@1
+        inputs:
+          artifactName: 'manifests'
+          path: '$(Build.SourcesDirectory)/.cd'
+
+- stage: DeployTest
+  displayName: DeployTest
+  dependsOn: Build
+  jobs:
+  - deployment: DeployTest
+    displayName: DeployTest
+    environment: 'test'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - download: none
+          - task: DownloadPipelineArtifact@2
+            inputs:
+              artifactName: 'manifests'
+              downloadPath: '$(System.ArtifactsDirectory)/manifests'
+
+          - task: KubernetesManifest@0
+            displayName: Deploy to Kubernetes cluster
+            inputs:
+              action: deploy
+              connectionType: 'kubernetesServiceConnection'
+              kubernetesServiceConnection: 'aks'
+              namespace: demo
+              manifests: |
+                $(System.ArtifactsDirectory)/manifests/deployment.yml
+                $(System.ArtifactsDirectory)/manifests/service.yml
